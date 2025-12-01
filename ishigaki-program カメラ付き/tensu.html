@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>家紋分類サイト（Teachable Machine + OpenCV.js）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    canvas {
+      margin-top: 0.5rem;
+      max-width: 60vw;   /* 画面幅の 60% まで。もっと小さくしたければ 40vw などに */
+      height: auto;      /* 縦横比を保ったまま縮小 */
+      border: 1px solid #444;
+    }
+  </style>
+  
+</head>
+
+<body>
+    <h1>石垣診断補助サイト</h1>
+    <nav class="nav">
+            <ul>
+                <li><a href="index.html">ホームへ</a></li>
+                <li><a href="koubai.html">勾配調査</a></li>
+                <li><a href="takasa.html">高さ調査</a></li>
+                <li><a href="tensu.html">家紋診断</a></li>
+                
+            </ul>
+            </nav>
+  <h2>家紋分類サイト</h2>
+  <p>画像をアップロードすると、AIが <b>丸・四角・三角・なし</b> のいずれかを判定します。</p>
+
+  <p id="status">⏳ モデル読み込み中...</p>
+  <input type="file" id="file" accept="image/*">
+  <canvas id="canvas"
+  ></canvas>
+  <div class="result" id="result"></div>
+
+ <!-- TensorFlow.js -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+
+<!-- Teachable Machine -->
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+<!-- OpenCV.js（安定CDN＋確認付き） -->
+<script async 
+  src="https://docs.opencv.org/4.x/opencv.js"
+  onload="document.getElementById('status').textContent += ' ✅ OpenCV.js読み込み成功';"
+  onerror="alert('⚠️ OpenCV.jsの読み込みに失敗しました。もう一度再読み込みしてください。');">
+</script>
+
+
+  <script>
+    const MODEL_URL = "https://teachablemachine.withgoogle.com/models/JssL1cK-Y/";  // ← あなたのモデルURLに置き換え
+    let tmModel;
+
+    const statusEl = document.getElementById('status');
+    const fileInput = document.getElementById('file');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const resultEl = document.getElementById('result');
+
+    // ---- モデルを読み込む ----
+    async function loadModel() {
+      try {
+        const modelURL = MODEL_URL + "model.json";
+        const metadataURL = MODEL_URL + "metadata.json";
+        tmModel = await tmImage.load(modelURL, metadataURL);
+        statusEl.textContent = "✅ モデル読み込み完了！画像を選んでください。";
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "❌ モデル読み込み失敗：URLやネットワークを確認してください。";
+      }
+    }
+
+    loadModel();
+
+    // ---- ファイル選択時 ----
+    fileInput.addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file || !tmModel) return;
+
+      const img = new Image();
+      img.onload = async () => {
+        // Canvasに描画
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+
+        // TMモデルで推論
+        const prediction = await tmModel.predict(img);
+        prediction.sort((a, b) => b.probability - a.probability);
+        const top = prediction[0];
+
+        resultEl.innerHTML = `🔍 結果：<b>${top.className}</b>（確率 ${(top.probability*100).toFixed(1)}%）`;
+
+// OpenCVで囲みを描画（物体ごとにTMで分類してマーク） 
+if (typeof cv !== 'undefined') {
+  const src = cv.imread(canvas);
+
+  // 前処理
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+  cv.threshold(gray, gray, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+
+  // ノイズ除去
+  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  cv.morphologyEx(gray, gray, cv.MORPH_OPEN, kernel);
+  kernel.delete();
+
+  // 輪郭抽出
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(gray, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  const W = src.cols, H = src.rows;
+  const MIN_AREA = 400;       // 小さすぎるゴミ除外
+  const MAX_FRAC = 0.90;      // 画像面積の90%超は外枠とみなす
+  const EDGE_MGN = 2;         // 端接触を外枠とみなす
+  const PAD = 4;              // 切り出し時の余白
+  const THRESH = 0.80;        // その物体を「図形あり」とみなす確率しきい値
+
+  // クラスごとの色
+  const colorMap = { "丸":"#1e90ff", "四角":"#00c853", "三角":"#ff1744" };
+
+  // 集計用
+  const counts = { "丸":0, "四角":0, "三角":0 };
+
+  // 可視化用画像
+  let vis = src.clone();
+
+  // 物体ごとに分類
+  // TMへ渡す一時キャンバス（切り出し表示用）
+  const roiCanvas = document.createElement('canvas');
+  const roiCtx = roiCanvas.getContext('2d');
+
+  for (let i = 0; i < contours.size(); ++i) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < MIN_AREA) { cnt.delete(); continue; }
+
+    const r = cv.boundingRect(cnt);
+
+    const touchesEdge =
+      r.x <= EDGE_MGN || r.y <= EDGE_MGN ||
+      (r.x + r.width)  >= (W - EDGE_MGN) ||
+      (r.y + r.height) >= (H - EDGE_MGN);
+
+    const isHuge = area > MAX_FRAC * W * H;
+    if (touchesEdge || isHuge) { cnt.delete(); continue; }
+
+    // ROI（余白つきで安全に切り出し）
+    const x0 = Math.max(0, r.x - PAD);
+    const y0 = Math.max(0, r.y - PAD);
+    const x1 = Math.min(W, r.x + r.width + PAD);
+    const y1 = Math.min(H, r.y + r.height + PAD);
+    const rw = x1 - x0;
+    const rh = y1 - y0;
+
+    // ROIをHTMLキャンバスに描き出してTMへ
+    roiCanvas.width = rw;
+    roiCanvas.height = rh;
+    // vis ではなく元の画像を使って切り出す
+    // （cv.imshow を介さず、表示中のCanvasから直接drawImage）
+    // いったん大きなCanvasから切り出すため、既存の大本canvasを使う
+    // → ここでは src(Mat) から直接は描けないため、表示済みcanvasから抜く：
+    roiCtx.drawImage(canvas, x0, y0, rw, rh, 0, 0, rw, rh);
+
+    // TMで分類
+    const preds = await tmModel.predict(roiCanvas);
+    preds.sort((a,b)=>b.probability - a.probability);
+    const best = preds[0];
+
+    // 「なし」以外でしきい値を超えたら枠＆ラベル
+    if (best.className !== "なし" && best.probability >= THRESH) {
+      counts[best.className] = (counts[best.className] || 0) + 1;
+
+      // 枠色
+      const hex = colorMap[best.className] || "#ffd600";
+      const col = new cv.Scalar(
+        parseInt(hex.slice(1,3),16),
+        parseInt(hex.slice(3,5),16),
+        parseInt(hex.slice(5,7),16),
+        255
+      );
+
+      // 枠を描く
+      cv.rectangle(
+        vis,
+        new cv.Point(r.x, r.y),
+        new cv.Point(r.x + r.width, r.y + r.height),
+        col, 2
+      );
+
+      // ラベル描画（Canvas 2D でテキスト）
+      // OpenCVで文字を入れるよりJSの方が綺麗に描けるため、あとで上から重ねる
+      // → 先にOpenCVの画像を出してから、テキストは2Dで描く
+      // 位置だけ覚えておく
+      if (!vis._labels) vis._labels = [];
+      vis._labels.push({
+        x: r.x + 4, y: Math.max(16, r.y + 16),
+        text: `${best.className} ${(best.probability*100).toFixed(0)}%`,
+        hex
+      });
+    }
+
+    cnt.delete();
+  }
+
+  // OpenCV画像を表示
+  cv.imshow(canvas, vis);
+
+  // ラベルをCanvas 2Dで重ね描き（アンチエイリアス文字）
+  const ctx2d = canvas.getContext('2d');
+  if (vis._labels) {
+    ctx2d.font = "16px sans-serif";
+    vis._labels.forEach(l => {
+      ctx2d.fillStyle = l.hex;
+      ctx2d.fillText(l.text, l.x, l.y);
+    });
+  }
+
+  // 結果の集計を表示（例：「丸2・四角1・三角0」）
+  const total = counts["丸"] + counts["四角"] + counts["三角"];
+  const summary = `検出数: 丸 ${counts["丸"]} / 四角 ${counts["四角"]} / 三角 ${counts["三角"]}（合計 ${total}）`;
+  // 既存の1枚全体のトップ結果表示に加えて、下行で個数サマリを付与
+  resultEl.innerHTML += `<br>${summary}`;
+
+  // 後始末
+  vis.delete();
+  src.delete(); gray.delete(); contours.delete(); hierarchy.delete();
+}
+
+
+      };
+      img.src = URL.createObjectURL(file);
+    });
+  </script>
+</body>
+</html>
